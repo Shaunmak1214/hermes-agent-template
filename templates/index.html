@@ -809,34 +809,73 @@
             </select>
           </div>
 
-          <div class="field-gap" x-show="selectedProvider">
+          <div class="field-gap" x-show="selectedProvider && providerMap[selectedProvider]?.key">
             <label class="field-label">API Key</label>
             <input type="password"
                    :value="selectedProvider ? (vars[providerMap[selectedProvider]?.key]||'') : ''"
-                   @input="if(selectedProvider) vars[providerMap[selectedProvider].key]=$event.target.value"
+                   @input="if(selectedProvider && providerMap[selectedProvider]?.key) vars[providerMap[selectedProvider].key]=$event.target.value"
                    :placeholder="selectedProvider ? (providerMap[selectedProvider]?.placeholder||'Paste your API key') : ''">
           </div>
 
           <div class="field-gap" x-show="selectedProvider">
             <label class="field-label">LLM Model</label>
             <input type="text" :value="vars.LLM_MODEL||''" @input="vars.LLM_MODEL=$event.target.value"
-                   placeholder="e.g. openai/gpt-4o-mini  or  deepseek/deepseek-chat">
-            <p class="hint">OpenRouter format: <code>provider/model-name</code></p>
+                   :placeholder="selectedProvider === 'xAI Grok (SuperGrok)' ? 'e.g. grok-4.3' : 'e.g. openai/gpt-4o-mini  or  deepseek/deepseek-chat'">
+            <p class="hint" x-show="selectedProvider !== 'xAI Grok (SuperGrok)'">OpenRouter format: <code>provider/model-name</code></p>
+            <p class="hint" x-show="selectedProvider === 'xAI Grok (SuperGrok)'">Model name only — e.g. <code>grok-4.3</code>, <code>grok-4.20-0309-reasoning</code></p>
           </div>
         </div>
 
-        <!-- xAI Grok SuperGrok OAuth -->
-        <div class="card" style="border-left:3px solid #6272ff;padding:14px 16px;">
-          <p style="margin:0 0 6px;font-size:13px;font-weight:600;color:#c9d1d9;">🔑 xAI Grok (SuperGrok — OAuth, no API key)</p>
-          <p class="hint" style="margin:0 0 10px;">SuperGrok uses OAuth instead of an API key. To use it on Railway:</p>
-          <ol class="hint" style="margin:0 0 10px;padding-left:18px;line-height:1.8;">
-            <li>Install Hermes locally: <code>pip install hermes-agent</code></li>
-            <li>Run <code>hermes model</code> → pick <strong>xAI Grok OAuth (SuperGrok)</strong> → complete browser login</li>
-            <li>Copy the contents of <code>~/.hermes/auth.json</code></li>
-            <li>Set <code>HERMES_AUTH_JSON_BOOTSTRAP</code> in Railway Variables to that JSON</li>
-            <li>Redeploy, then open the <a href="/?force=1" style="color:var(--accent2);">Hermes Dashboard</a> → model picker → select xAI Grok OAuth</li>
-          </ol>
-          <p class="hint" style="margin:0;">Tokens auto-refresh. Set <code>LLM_MODEL</code> to <code>grok-4</code> or <code>grok-3-mini</code>.</p>
+        <!-- xAI Grok SuperGrok OAuth — shown when xAI provider is selected -->
+        <div class="card" x-show="selectedProvider === 'xAI Grok (SuperGrok)'" style="border-left:3px solid #6272ff;padding:14px 16px;">
+          <p style="margin:0 0 10px;font-size:13px;font-weight:600;color:#c9d1d9;">xAI Grok — SuperGrok OAuth</p>
+
+          <!-- not yet started -->
+          <template x-if="xai.status === 'none'">
+            <div>
+              <p class="hint" style="margin:0 0 10px;">Connect your SuperGrok subscription. Click below — a new tab will open where you enter a short code to authorise this deployment. No API key needed; tokens auto-refresh.</p>
+              <button @click="startXaiOauth()" :disabled="xai.loading"
+                      style="width:100%;padding:8px 0;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer;opacity:1;"
+                      :style="xai.loading ? 'opacity:.6;cursor:default;' : ''">
+                <span x-show="!xai.loading">Connect SuperGrok</span>
+                <span x-show="xai.loading">Starting…</span>
+              </button>
+              <p x-show="xai.error" x-text="xai.error" style="color:var(--red);margin:8px 0 0;font-size:12px;"></p>
+            </div>
+          </template>
+
+          <!-- pending — show code -->
+          <template x-if="xai.status === 'pending'">
+            <div>
+              <p class="hint" style="margin:0 0 8px;">A new tab opened. Enter the code below on the xAI page, then come back here.</p>
+              <a :href="xai.verificationUri" target="_blank"
+                 style="display:block;color:var(--accent2);font-size:12px;word-break:break-all;margin-bottom:10px;"
+                 x-text="xai.verificationUri"></a>
+              <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:14px;text-align:center;margin-bottom:10px;">
+                <span style="font-family:var(--font-mono);font-size:26px;letter-spacing:5px;color:#c9d1d9;" x-text="xai.userCode"></span>
+              </div>
+              <p class="hint" style="text-align:center;margin:0;">⏳ Waiting for authorisation…</p>
+            </div>
+          </template>
+
+          <!-- authorized -->
+          <template x-if="xai.status === 'authorized'">
+            <div style="text-align:center;padding:6px 0;">
+              <p style="color:var(--green);font-size:13px;margin:0 0 4px;">✓ SuperGrok authorised</p>
+              <p class="hint" style="margin:0;">Gateway is restarting with xAI OAuth. Set model below (e.g. <code>grok-4.3</code>).</p>
+            </div>
+          </template>
+
+          <!-- error / expired -->
+          <template x-if="xai.status === 'error' || xai.status === 'expired'">
+            <div>
+              <p style="color:var(--red);font-size:13px;margin:0 0 8px;" x-text="xai.error || 'Authorisation failed or expired'"></p>
+              <button @click="xai.status='none'; xai.error=''; startXaiOauth()"
+                      style="width:100%;padding:8px 0;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer;">
+                Try Again
+              </button>
+            </div>
+          </template>
         </div>
 
         <!-- Messaging Channels -->
@@ -1297,7 +1336,10 @@ function app() {
       'Step Plan':          { key: 'STEPFUN_API_KEY',       placeholder: ''          },
       'Vercel AI Gateway':  { key: 'AI_GATEWAY_API_KEY',    placeholder: ''          },
       'Google AI Studio':   { key: 'GEMINI_API_KEY',        placeholder: 'AIza...'   },
+      'xAI Grok (SuperGrok)': { key: null, isOauth: 'xai' },
     },
+
+    xai: { loading: false, userCode: '', verificationUri: '', status: 'none', error: '' },
 
     selectedProvider: '',
 
@@ -1311,14 +1353,14 @@ function app() {
     get pendingCount() { return this.pending.length; },
 
     get isSetupDone() {
-      const keys = Object.values(this.providerMap).map(p => p.key);
-      return !!(this.vars.LLM_MODEL && keys.some(k => this.vars[k]));
+      const keys = Object.values(this.providerMap).filter(p => p.key).map(p => p.key);
+      return !!(this.vars.LLM_MODEL && (keys.some(k => this.vars[k]) || this.xai.status === 'authorized'));
     },
 
     onProviderChange() {
-      // Clear keys from other providers when switching
+      // Clear keys from other providers when switching; skip null-key (OAuth) entries.
       for (const [name, p] of Object.entries(this.providerMap)) {
-        if (name !== this.selectedProvider) this.vars[p.key] = '';
+        if (name !== this.selectedProvider && p.key) this.vars[p.key] = '';
       }
     },
 
@@ -1340,6 +1382,36 @@ function app() {
       if (t.key === 'BROWSERBASE_API_KEY') this.vars.BROWSERBASE_PROJECT_ID = '';
     },
 
+    async startXaiOauth() {
+      this.xai.loading = true;
+      this.xai.error = '';
+      try {
+        const r = await fetch('/setup/api/oauth/xai/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: this.vars.LLM_MODEL || 'grok-4.3' }),
+        });
+        const d = await r.json();
+        if (!r.ok) { this.xai.error = d.error || 'Failed to start OAuth'; this.xai.loading = false; return; }
+        this.xai.userCode = d.user_code;
+        this.xai.verificationUri = d.verification_uri;
+        this.xai.status = 'pending';
+        window.open(d.verification_uri, '_blank');
+        const poll = setInterval(async () => {
+          const s = await fetch('/setup/api/oauth/xai/status').then(r2 => r2.json()).catch(() => ({ status: 'pending' }));
+          this.xai.status = s.status;
+          if (s.status === 'authorized') {
+            clearInterval(poll);
+            await this.loadConfig();
+          } else if (s.status === 'error' || s.status === 'expired') {
+            this.xai.error = s.error || 'Authorization failed or expired';
+            clearInterval(poll);
+          }
+        }, 3000);
+      } catch (e) { this.xai.error = 'Network error: ' + e.message; }
+      this.xai.loading = false;
+    },
+
     async init() {
       await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing()]);
       setInterval(() => this.loadStatus(),  5000);
@@ -1353,9 +1425,17 @@ function app() {
         if (r.ok) {
           const d = await r.json();
           this.vars = d.vars || {};
-          // Detect active provider
+          // Detect active provider (skip null-key OAuth entries in the key check)
           for (const [name, p] of Object.entries(this.providerMap)) {
-            if (this.vars[p.key]) { this.selectedProvider = name; break; }
+            if (p.key && this.vars[p.key]) { this.selectedProvider = name; break; }
+          }
+          // Detect xAI OAuth (no API key — check backend status endpoint)
+          if (!this.selectedProvider) {
+            const xs = await fetch('/setup/api/oauth/xai/status').then(r2 => r2.json()).catch(() => ({ status: 'none' }));
+            if (xs.status === 'authorized') {
+              this.selectedProvider = 'xAI Grok (SuperGrok)';
+              this.xai.status = 'authorized';
+            }
           }
           // Detect active channels
           this.channelsEnabled = {
@@ -1374,8 +1454,8 @@ function app() {
           // savedConfigComplete reflects the persisted server-side state.
           // Masked secrets from the server still show truthy, so this
           // mirrors the backend's is_config_complete() check.
-          const providerKeys = Object.values(this.providerMap).map(p => p.key);
-          this.savedConfigComplete = !!(this.vars.LLM_MODEL && providerKeys.some(k => this.vars[k]));
+          const providerKeys = Object.values(this.providerMap).filter(p => p.key).map(p => p.key);
+          this.savedConfigComplete = !!(this.vars.LLM_MODEL && (providerKeys.some(k => this.vars[k]) || this.xai.status === 'authorized'));
         }
       } catch {}
     },

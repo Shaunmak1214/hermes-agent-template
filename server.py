@@ -254,6 +254,228 @@ def write_env(path: Path, data: dict[str, str]) -> None:
     path.write_text("\n".join(lines))
 
 
+# ── xAI Grok SuperGrok OAuth (Device Code — RFC 8628) ───────────────────────
+# xAI's OIDC discovery at https://auth.x.ai/.well-known/openid-configuration
+# declares device_authorization_endpoint, so Device Code flow works without
+# any redirect URL. The client_id matches hermes's own Grok CLI credential.
+_XAI_CLIENT_ID   = "b1a00492-073a-47ea-816f-4c329264a828"
+_XAI_SCOPE       = "openid profile email offline_access grok-cli:access api:access"
+_XAI_DEVICE_URL  = "https://auth.x.ai/oauth2/device/code"
+_XAI_TOKEN_URL   = "https://auth.x.ai/oauth2/token"
+_XAI_GRANT_TYPE  = "urn:ietf:params:oauth:grant-type:device_code"
+
+_xai_oauth_state: dict | None = None  # one auth at a time (single-user deployment)
+
+
+def _has_xai_oauth_tokens() -> bool:
+    """True when auth.json contains a valid xAI OAuth refresh token."""
+    auth_path = Path(HERMES_HOME) / "auth.json"
+    if not auth_path.exists():
+        return False
+    try:
+        data = json.loads(auth_path.read_text())
+        tokens = data.get("providers", {}).get("xai-oauth", {}).get("tokens", {})
+        return bool(isinstance(tokens, dict) and tokens.get("refresh_token"))
+    except Exception:
+        return False
+
+
+def _save_xai_auth_json(tokens: dict) -> None:
+    """Write xAI OAuth tokens to auth.json in hermes's expected format."""
+    auth_path = Path(HERMES_HOME) / "auth.json"
+    existing: dict = {}
+    if auth_path.exists():
+        try:
+            existing = json.loads(auth_path.read_text())
+        except Exception:
+            pass
+    if not isinstance(existing, dict):
+        existing = {}
+
+    providers = existing.setdefault("providers", {})
+    providers["xai-oauth"] = {
+        "tokens": tokens,
+        "auth_mode": "oauth_device",
+        "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "discovery": {
+            "authorization_endpoint": "https://auth.x.ai/oauth2/authorize",
+            "token_endpoint": _XAI_TOKEN_URL,
+        },
+        "redirect_uri": "",
+    }
+    existing["active_provider"] = "xai-oauth"
+    existing["version"] = 2
+    existing["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    auth_path.write_text(json.dumps(existing, indent=2) + "\n")
+    try:
+        auth_path.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _apply_xai_oauth_config(model: str) -> None:
+    """Write config.yaml with provider=xai-oauth and the chosen model."""
+    import yaml
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if config_path.exists():
+        try:
+            with config_path.open() as f:
+                loaded = yaml.safe_load(f)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            pass
+
+    merged = dict(existing)
+    merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
+    if model:
+        merged_model["default"] = model
+    merged_model["provider"] = "xai-oauth"
+    merged["model"] = merged_model
+
+    merged_terminal = dict(merged.get("terminal") if isinstance(merged.get("terminal"), dict) else {})
+    merged_terminal.setdefault("backend", "local")
+    merged_terminal.setdefault("timeout", 60)
+    merged_terminal.setdefault("cwd", "/tmp")
+    merged["terminal"] = merged_terminal
+
+    merged_agent = dict(merged.get("agent") if isinstance(merged.get("agent"), dict) else {})
+    merged_agent.setdefault("max_iterations", 50)
+    merged["agent"] = merged_agent
+    merged["data_dir"] = HERMES_HOME
+
+    with config_path.open("w") as f:
+        yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
+
+    # Also persist LLM_MODEL in .env so is_config_complete sees it
+    if model:
+        existing_env = read_env(ENV_FILE)
+        existing_env["LLM_MODEL"] = model
+        write_env(ENV_FILE, existing_env)
+
+
+async def _poll_xai_device_auth(state: dict) -> None:
+    """Background task: poll xAI token endpoint until authorized or expired."""
+    client = get_http_client()
+    while time.time() < state["expires_at"]:
+        await asyncio.sleep(state["interval"])
+        try:
+            resp = await client.post(
+                _XAI_TOKEN_URL,
+                data={
+                    "grant_type": _XAI_GRANT_TYPE,
+                    "device_code": state["device_code"],
+                    "client_id": _XAI_CLIENT_ID,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=httpx.Timeout(15.0),
+            )
+        except Exception as e:
+            print(f"[xai-oauth] poll error: {e!r}", flush=True)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                tokens = resp.json()
+            except Exception:
+                state["status"] = "error"
+                state["error"] = "Invalid token response from xAI"
+                return
+            _save_xai_auth_json(tokens)
+            _apply_xai_oauth_config(state.get("model", ""))
+            state["status"] = "authorized"
+            print("[xai-oauth] authorized — restarting gateway", flush=True)
+            asyncio.create_task(gw.restart())
+            return
+
+        try:
+            err_data = resp.json()
+        except Exception:
+            err_data = {}
+        error = err_data.get("error", "")
+
+        if error == "authorization_pending":
+            continue
+        elif error == "slow_down":
+            state["interval"] = min(state["interval"] + 5, 30)
+        else:
+            state["status"] = "error"
+            state["error"] = err_data.get("error_description", error) or error or "Unknown error"
+            print(f"[xai-oauth] failed: {error}", flush=True)
+            return
+
+    state["status"] = "expired"
+    print("[xai-oauth] device code expired", flush=True)
+
+
+async def api_oauth_xai_start(request: Request) -> Response:
+    global _xai_oauth_state
+    if err := guard(request):
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    model = str(body.get("model", "")).strip()
+
+    client = get_http_client()
+    try:
+        resp = await client.post(
+            _XAI_DEVICE_URL,
+            data={"client_id": _XAI_CLIENT_ID, "scope": _XAI_SCOPE},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=httpx.Timeout(15.0),
+        )
+    except Exception as e:
+        return JSONResponse({"error": f"Could not reach xAI: {e}"}, status_code=502)
+
+    if resp.status_code != 200:
+        return JSONResponse(
+            {"error": f"xAI returned {resp.status_code}: {resp.text[:200]}"},
+            status_code=502,
+        )
+
+    try:
+        data = resp.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid response from xAI"}, status_code=502)
+
+    _xai_oauth_state = {
+        "device_code": data["device_code"],
+        "user_code": data["user_code"],
+        "verification_uri": data.get("verification_uri_complete") or data["verification_uri"],
+        "expires_at": time.time() + data.get("expires_in", 900),
+        "interval": max(data.get("interval", 5), 5),
+        "status": "pending",
+        "model": model,
+    }
+    asyncio.create_task(_poll_xai_device_auth(_xai_oauth_state))
+
+    return JSONResponse({
+        "user_code": data["user_code"],
+        "verification_uri": _xai_oauth_state["verification_uri"],
+        "expires_in": data.get("expires_in", 900),
+    })
+
+
+async def api_oauth_xai_status(request: Request) -> Response:
+    if err := guard(request):
+        return err
+    if _xai_oauth_state is None:
+        # No active flow — check if a previous session left valid tokens.
+        if _has_xai_oauth_tokens():
+            return JSONResponse({"status": "authorized"})
+        return JSONResponse({"status": "none"})
+    return JSONResponse({
+        "status": _xai_oauth_state["status"],
+        "error": _xai_oauth_state.get("error", ""),
+    })
+
+
 def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """Single source of truth for 'ready to run the gateway'.
 
@@ -262,7 +484,7 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     if data is None:
         data = read_env(ENV_FILE)
     has_model = bool(data.get("LLM_MODEL"))
-    has_provider = any(data.get(k) for k in PROVIDER_KEYS)
+    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_xai_oauth_tokens()
     return has_model and has_provider
 
 
@@ -1135,6 +1357,8 @@ routes = [
     Route("/setup/api/pairing/deny",            api_pairing_deny,    methods=["POST"]),
     Route("/setup/api/pairing/approved",        api_pairing_approved),
     Route("/setup/api/pairing/revoke",          api_pairing_revoke,  methods=["POST"]),
+    Route("/setup/api/oauth/xai/start",         api_oauth_xai_start, methods=["POST"]),
+    Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
 
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
