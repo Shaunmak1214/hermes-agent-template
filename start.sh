@@ -57,6 +57,17 @@ fi
 # container), so removing the file unconditionally is safe.
 rm -f /data/.hermes/gateway.pid
 
+# Durable lazy-install target for opt-in backends (supermemory, mem0, firecrawl, etc.).
+# The template installs hermes into system Python (`uv pip install --system`) with no
+# venv, so `uv pip install` at runtime fails with "No virtual environment found." Set
+# HERMES_LAZY_INSTALL_TARGET to redirect runtime package installs into a writable dir
+# on the persistent volume — same mechanism the official Docker image bakes in. This
+# must be exported so the gateway process inherits it; hermes_bootstrap.py activates it
+# at startup. Without it, any lazy dep (including the default supermemory provider)
+# fails on every fresh container deploy.
+mkdir -p /data/.hermes/lazy-packages
+export HERMES_LAZY_INSTALL_TARGET=/data/.hermes/lazy-packages
+
 # Tell the dashboard its externally reachable URL.
 # hermes >= v2026.7.20 builds the MCP OAuth redirect_uri from the request's own
 # Host header. Our reverse proxy must strip that Host (hermes 400s anything but
