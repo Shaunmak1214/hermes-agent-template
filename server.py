@@ -1542,6 +1542,20 @@ class Dashboard:
                 env=build_hermes_env(),
             )
             print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
+            # One line describing the auth shape this dashboard was started
+            # with. Nearly every dashboard-side problem in this template comes
+            # down to these two facts, so a user can paste this instead of
+            # needing shell access to diagnose it.
+            public_url = hermes_dashboard_public_url()
+            user, _ = hermes_dashboard_credentials()
+            if public_url:
+                print(f"[dashboard] auth gate ON — public_url={public_url} user={user!r}; "
+                      f"this proxy signs in for you, so no second login should appear",
+                      flush=True)
+            else:
+                print("[dashboard] auth gate OFF — no RAILWAY_PUBLIC_DOMAIN, so hermes "
+                      "builds MCP OAuth redirects from the loopback address and those "
+                      "sign-ins will not complete", flush=True)
             self._drain_task = asyncio.create_task(self._drain())
         except Exception as e:
             print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
@@ -1789,6 +1803,17 @@ async def api_config_put(request: Request):
             model_warning = await set_active_model_via_hermes(
                 hermes_provider_id, model_value, base_url=pin_base_url, api_key=pin_api_key
             )
+            # Log the outcome either way. A failed pin is a SILENT downgrade —
+            # hermes falls back to provider auto-resolution, which works for a
+            # single-provider setup and fails opaquely for custom endpoints
+            # (their base_url/api_key are only written by this pin). The reason
+            # otherwise only exists in the HTTP response body, which nobody sees.
+            if model_warning:
+                print(f"[config] provider pin FAILED — provider={hermes_provider_id} "
+                      f"model={model_value!r}: {model_warning}", flush=True)
+            else:
+                print(f"[config] provider pin ok — provider={hermes_provider_id} "
+                      f"model={model_value!r}", flush=True)
 
         if restart:
             asyncio.create_task(gw.restart())
@@ -2525,6 +2550,12 @@ class HermesSession:
         async with self._lock:
             if self._generation != seen_generation:
                 return bool(self._cookies)
+            if self._cookies:
+                # Expected on a dashboard restart or after the 12h access-token
+                # TTL. Logged so a burst of these is visibly a session problem
+                # rather than an unexplained slowdown.
+                print("[dashboard-auth] dashboard rejected the held session — "
+                      "signing in again", flush=True)
             if await self._login():
                 self._generation += 1
                 return True
@@ -2670,6 +2701,11 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     # match what the dashboard subprocess started with. Fail visibly rather
     # than forwarding a redirect that would loop.
     if _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
+        user, _ = hermes_dashboard_credentials()
+        print(f"[dashboard-auth] still unauthenticated after signing in as {user!r} — "
+              f"{request.method} {request.url.path}. The dashboard subprocess was started "
+              f"with different credentials; restart the gateway from Status (that restarts "
+              f"the dashboard too) or redeploy.", flush=True)
         return HTMLResponse(DASHBOARD_AUTH_FAILED_HTML, status_code=502)
 
     # Surface non-2xx responses from hermes into Railway logs so we can
