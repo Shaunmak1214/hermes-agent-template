@@ -1629,7 +1629,13 @@ async def _get_hermes_session_token() -> str:
     """
     client = get_http_client()
     resp = await client.get(f"{HERMES_DASHBOARD_URL}/", timeout=httpx.Timeout(10.0))
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        # Gated mode (invariant 8): `/` 302s to the login page, so there is no
+        # SPA shell and no token to scrape. Callers authenticate with the
+        # HermesSession cookies instead. Returning "" rather than raising keeps
+        # that a normal path — raise_for_status() here made every provider pin
+        # fail with "Could not fetch a Hermes session token".
+        return ""
     match = _HERMES_SESSION_TOKEN_RE.search(resp.text)
     return match.group(1) if match else ""
 
@@ -1677,10 +1683,18 @@ async def set_active_model_via_hermes(
         session_token = await _get_hermes_session_token()
     except httpx.HTTPError as e:
         return f"Could not fetch a Hermes session token to pin {provider_id} ({e}); using auto-resolution instead."
-    headers = {_SESSION_TOKEN_HEADER: session_token} if session_token else {}
 
-    try:
-        resp = await client.post(
+    async def _post(session: dict[str, str]) -> httpx.Response:
+        """One attempt, authenticated for whichever mode the dashboard is in.
+
+        The token header authenticates an ungated dashboard, the session cookies
+        a gated one. This is the only dashboard call that does not go through
+        route_proxy(), so it carries its own credentials.
+        """
+        headers = {_SESSION_TOKEN_HEADER: session_token} if session_token else {}
+        if session:
+            headers["cookie"] = "; ".join(f"{k}={v}" for k, v in session.items())
+        return await client.post(
             f"{HERMES_DASHBOARD_URL}/api/model/set",
             json={
                 "scope": "main",
@@ -1696,6 +1710,13 @@ async def set_active_model_via_hermes(
             headers=headers,
             timeout=httpx.Timeout(15.0),
         )
+
+    generation, session = hermes_session.snapshot()
+    try:
+        resp = await _post(session)
+        if resp.status_code == 401 and await hermes_session.refresh(generation):
+            _, session = hermes_session.snapshot()
+            resp = await _post(session)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
         return f"Could not reach the Hermes dashboard to pin {provider_id} ({e}); using auto-resolution instead."
     except httpx.RequestError as e:
