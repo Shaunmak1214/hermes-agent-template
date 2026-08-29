@@ -61,17 +61,11 @@ fi
 # container), so removing all three unconditionally is safe.
 rm -f /data/.hermes/gateway.pid /data/.hermes/gateway.lock /data/.hermes/gateway.sock
 
-# HERMES_DASHBOARD_PUBLIC_URL is deliberately NOT set (removed in v2026.8.27).
-# We used to derive it from RAILWAY_PUBLIC_DOMAIN so hermes could build MCP
-# OAuth redirect_uris that point at the public host rather than the loopback
-# backend our proxy talks to. As of v2026.8.27 that same value feeds
-# should_require_dashboard_auth() (hermes_cli/web_server.py): a non-loopback
-# public_url turns the dashboard auth gate ON even on a loopback bind, and with
-# no hermes auth provider configured the dashboard SystemExits at startup.
-# Dashboard has no respawn supervisor, so every proxied page 503s until the
-# container is redeployed — while /setup and /health stay green.
-# Trade-off accepted: MCP OAuth flows that need a redirect back to the
-# dashboard land on the loopback URL and fail; everything else works. Do not
-# re-add this without also solving the auth gate (see server.py:build_hermes_env).
+# HERMES_DASHBOARD_PUBLIC_URL is deliberately NOT exported here. server.py owns
+# it: build_hermes_env() sets it only alongside the basic-auth credentials that
+# satisfy hermes' auth gate. Declaring the URL without them makes the dashboard
+# SystemExit at startup (v2026.8.27's should_require_dashboard_auth), and since
+# Dashboard has no respawn supervisor every proxied page 503s until redeploy
+# while /setup and /health stay green. Setting it here would skip that pairing.
 
 exec python /app/server.py

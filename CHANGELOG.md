@@ -18,26 +18,50 @@ release.
 - Hermes Agent **v2026.8.13 → v2026.8.27**, covering five upstream releases
   (8.16, 8.16.2, 8.18, 8.19, 8.27). The provider registry grew 47 → 58 entries;
   none of the 22 ids this template maps were renamed or removed.
-- **Sub-agent work budget raised on new deployments.** Upstream's seeded
-  `cli-config.yaml.example` moves `delegation.max_iterations` 50 → 250.
-  Deliberately left at the upstream default — existing volumes keep 50, since
-  the file is only copied when a volume is first created.
+- **Sub-agent limits raised upstream.** `delegation.max_iterations` (per-child
+  tool-call budget) goes 50 → 250 and `max_concurrent_children` 3 → 10. Both are
+  left at upstream's defaults, but they land differently: `max_iterations` is
+  written into an existing `config.yaml`, so existing deployments keep 50 until
+  they run a config migration, while `max_concurrent_children` is *not* written
+  — so it inherits the new default immediately on upgrade. Existing bots
+  therefore run up to 3× more sub-agents in parallel straight away, which can
+  raise provider spend.
 
 ### Changes to support upstream updates
-- **The dashboard would not have started at all.** v2026.8.27 routes
-  `dashboard.public_url` into the new `should_require_dashboard_auth()`
-  (`hermes_cli/web_server.py`), so a non-loopback public URL engages the auth
-  gate *even on a loopback bind*; with no hermes auth provider configured the
-  dashboard `SystemExit`s at startup. `start.sh` derived that value from
-  `RAILWAY_PUBLIC_DOMAIN`, so every deploy would have 503'd every proxied page
-  while `/setup` and `/health` stayed green — `Dashboard` has no respawn
-  supervisor. Reproduced in Docker with an A/B pair (identical images, only
-  `RAILWAY_PUBLIC_DOMAIN` differing): `HERMES_DASHBOARD_READY` vs
-  `EXITED with code 1`. Fixed by no longer setting it — popped in
-  `build_hermes_env()` (covers a Railway variable) *and* stripped from
-  `$HERMES_HOME/.env` by `_sanitize_env_file()`, since hermes loads that file
-  into its own `os.environ`. **Trade-off:** MCP OAuth flows needing a redirect
-  back to the dashboard now land on the loopback URL and fail.
+- **The dashboard would not have started at all, and MCP sign-ins would have
+  broken.** v2026.8.27 routes `dashboard.public_url` into the new
+  `should_require_dashboard_auth()` (`hermes_cli/web_server.py`), so a
+  non-loopback public URL engages hermes' auth gate *even on a loopback bind*;
+  with no auth provider the dashboard `SystemExit`s at startup. `start.sh`
+  derived that value from `RAILWAY_PUBLIC_DOMAIN`, so every deploy would have
+  503'd every proxied page while `/setup` and `/health` stayed green — `Dashboard`
+  has no respawn supervisor. Reproduced in Docker with an A/B pair (identical
+  images, only `RAILWAY_PUBLIC_DOMAIN` differing): `HERMES_DASHBOARD_READY` vs
+  `EXITED with code 1`.
+
+  Simply suppressing the URL fixes the dashboard but breaks something else: it
+  is *also* the base hermes builds MCP OAuth `redirect_uri`s from
+  (`_mcp_oauth_callback_url`), so every OAuth MCP server would redirect to
+  `http://127.0.0.1:9119/...` — a dead page, silently. Verified live on both
+  releases: v2026.8.13 returned the real public URL, v2026.8.27 returned
+  loopback.
+
+  So the template **satisfies the gate** rather than dodging it. Hermes' bundled
+  `basic` auth provider is configured from the same admin credentials the setup
+  page already uses, and `server.py` signs in to the dashboard on the user's
+  behalf, injecting that session into proxied requests. **Nobody sees a second
+  login screen**, and MCP redirects resolve to the real host. On by default,
+  nothing to configure; `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` / `_PASSWORD` /
+  `_SECRET` are available as explicit overrides.
+- **The sign-in page moved to `/setup/login`.** Gated hermes redirects
+  unauthenticated requests to `/login`, and a route of ours at that path answered
+  instead — the browser bounced between the two until it gave up (8 redirects,
+  reproduced). `/login` now redirects to the new path so bookmarks keep working,
+  and the proxy re-signs-in and replays internally so that redirect should never
+  reach a browser at all.
+- **Dashboard sessions survive restarts.** Hermes signs its session tokens with a
+  per-process key unless one is supplied, and every config save restarts the
+  dashboard. The key is now generated once and kept on the volume.
 - **Restores could abort on a sound backup.** Upstream's `_EXCLUDED_DIRS` gained
   `state-snapshots`, `browser-profiles` and `browser-profile`; our
   `_BACKUP_EXCLUDED_DIRS` mirror still had the old 15, so any `.db` under those

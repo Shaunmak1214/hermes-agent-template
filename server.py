@@ -612,6 +612,69 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
         yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
 
 
+# ── Hermes dashboard auth (so MCP OAuth redirects resolve to the real host) ──
+# v2026.8.27 routes `dashboard.public_url` into should_require_dashboard_auth()
+# (hermes_cli/web_server.py): declaring a public URL turns hermes' own auth gate
+# on even for a loopback bind. That URL is ALSO the base hermes builds MCP OAuth
+# redirect_uris from (_mcp_oauth_callback_url), so suppressing it — the previous
+# fix — left every OAuth MCP server redirecting to http://127.0.0.1:9119, a dead
+# page in the user's browser.
+#
+# So we satisfy the gate instead of dodging it: hermes' bundled `basic` auth
+# provider is configured from the same admin credentials the setup page uses,
+# and HermesSession below logs in on the user's behalf so nobody ever sees a
+# second login screen. Verified live on v2026.8.27: with the gate on, the
+# redirect_uri comes back as https://<public-domain>/api/mcp/oauth/callback/<x>.
+
+
+def hermes_dashboard_credentials() -> tuple[str, str]:
+    """Credentials hermes' `basic` auth provider accepts.
+
+    Single source of truth: the same pair is handed to the dashboard subprocess
+    AND used by HermesSession to log in. Resolving them in two places would let
+    them drift, and a drift means every proxied page 401s.
+    """
+    user = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "").strip()
+    pw = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "").strip()
+    return (user or ADMIN_USERNAME), (pw or ADMIN_PASSWORD)
+
+
+def hermes_dashboard_auth_secret() -> str:
+    """Token-signing key for hermes' basic-auth sessions, stable across deploys.
+
+    Generated once and kept on the volume. Without a fixed secret hermes mints a
+    random key per process, so every dashboard restart (each config save calls
+    Dashboard.restart()) would invalidate the session HermesSession holds and
+    force a needless re-login.
+    """
+    explicit = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_SECRET", "").strip()
+    if explicit:
+        return explicit
+    path = Path(HERMES_HOME) / ".dashboard_auth_secret"
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    secret = secrets.token_hex(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(secret)
+        path.chmod(0o600)
+    except OSError as e:
+        # Falls back to a per-process value: sessions then die on each dashboard
+        # restart, which HermesSession recovers from silently.
+        print(f"[server] could not persist dashboard auth secret: {e}", flush=True)
+    return secret
+
+
+def hermes_dashboard_public_url() -> str:
+    """Public origin hermes should build OAuth redirect_uris from, or ""."""
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    return f"https://{domain}" if domain else ""
+
+
 # Env keys that kill the dashboard if a hermes subprocess ever sees them. The
 # dashboard has no respawn supervisor, so each one means every proxied page 503s
 # until the container is redeployed, while /setup and /health stay green.
@@ -627,7 +690,10 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
 #                                value turns the auth gate on even for a
 #                                loopback bind, and with no hermes auth provider
 #                                configured the dashboard SystemExits at
-#                                startup. See the matching note in start.sh.
+#                                startup. build_hermes_env() re-adds it AFTER
+#                                this strip, paired with the basic-auth
+#                                credentials that satisfy the gate — an inbound
+#                                value would arrive without them.
 #
 # Stripped from BOTH the subprocess env and $HERMES_HOME/.env: hermes loads that
 # file into its own os.environ at startup, so popping alone is not enough
@@ -672,10 +738,24 @@ def build_hermes_env() -> dict[str, str]:
     # config.yaml, and inherited by all three restart paths (in-band, SIGUSR1,
     # and the dashboard's detached restart). setdefault: set e.g. 120 to re-arm.
     env.setdefault("HERMES_RESTART_AFTER_TURN_TIMEOUT", "0")
-    # Both vectors matter: this pop covers a Railway service variable (which
-    # lands in our own os.environ); _sanitize_env_file() covers the .env file.
+    # Drop inbound values first: the template is the only thing allowed to
+    # decide these (this pop covers a Railway service variable, which lands in
+    # our own os.environ; _sanitize_env_file() covers the .env file).
     for key in DASHBOARD_KILLING_KEYS:
         env.pop(key, None)
+    # Configure hermes' own auth provider, then declare the public URL. The URL
+    # engages hermes' auth gate, and the gate SystemExits at startup unless a
+    # provider is registered — so it is only ever set alongside credentials that
+    # satisfy it. ADMIN_PASSWORD is always populated (generated when unset), so
+    # in practice this is always on; the guard keeps the ordering explicit.
+    user, password = hermes_dashboard_credentials()
+    if user and password:
+        env["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] = user
+        env["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = password
+        env["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] = hermes_dashboard_auth_secret()
+        public_url = hermes_dashboard_public_url()
+        if public_url:
+            env["HERMES_DASHBOARD_PUBLIC_URL"] = public_url
     return env
 
 
@@ -1030,7 +1110,7 @@ COOKIE_MAX_AGE = 7 * 86400  # 7 days
 COOKIE_SECRET = secrets.token_bytes(32)
 
 # Public paths — no auth required. Everything else is behind the cookie gate.
-PUBLIC_PATHS = {"/health", "/login", "/logout"}
+PUBLIC_PATHS = {"/health", "/setup/login", "/logout"}
 
 
 def _make_auth_token() -> str:
@@ -1069,7 +1149,7 @@ def _safe_return_to(value: str) -> str:
 def guard(request: Request) -> Response | None:
     """Enforce auth on protected routes.
 
-    - HTML navigation: 302 to /login?returnTo=<path>
+    - HTML navigation: 302 to /setup/login?returnTo=<path>
     - API / XHR: 401 JSON (so the SPA's fetch() can surface it cleanly)
     """
     if _is_authenticated(request):
@@ -1080,7 +1160,7 @@ def guard(request: Request) -> Response | None:
         rt = request.url.path
         if request.url.query:
             rt = f"{rt}?{request.url.query}"
-        return RedirectResponse(f"/login?returnTo={_url_quote(rt)}", status_code=302)
+        return RedirectResponse(f"/setup/login?returnTo={_url_quote(rt)}", status_code=302)
     return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
 
@@ -1121,7 +1201,7 @@ button:hover{background:#7b8fff;border-color:#7b8fff}
     <div class="brand-sub">Sign in to continue</div>
   </div>
   __ERROR__
-  <form method="POST" action="/login">
+  <form method="POST" action="/setup/login">
     <input type="hidden" name="returnTo" value="__RETURN_TO__">
     <label for="username">Username</label>
     <input id="username" name="username" type="text" autocomplete="username" autofocus required>
@@ -1140,7 +1220,7 @@ def _html_escape(s: str) -> str:
 
 
 async def page_login(request: Request) -> Response:
-    """GET /login — render the sign-in form."""
+    """GET /setup/login — render the sign-in form."""
     # Already signed in? Bounce to returnTo (or /).
     if _is_authenticated(request):
         return RedirectResponse(_safe_return_to(request.query_params.get("returnTo", "/")), status_code=302)
@@ -1154,7 +1234,7 @@ async def page_login(request: Request) -> Response:
 
 
 async def login_post(request: Request) -> Response:
-    """POST /login — validate creds and set the auth cookie."""
+    """POST /setup/login — validate creds and set the auth cookie."""
     form = await request.form()
     username = str(form.get("username", ""))
     password = str(form.get("password", ""))
@@ -1173,12 +1253,20 @@ async def login_post(request: Request) -> Response:
             path="/",
         )
         return resp
-    return RedirectResponse(f"/login?returnTo={_url_quote(return_to)}&error=1", status_code=302)
+    return RedirectResponse(f"/setup/login?returnTo={_url_quote(return_to)}&error=1", status_code=302)
+
+
+async def login_redirect(request: Request) -> Response:
+    """GET /login — keep old bookmarks working after the move to /setup/login."""
+    rt = request.query_params.get("returnTo") or request.query_params.get("next") or "/"
+    return RedirectResponse(
+        f"/setup/login?returnTo={_url_quote(_safe_return_to(rt))}", status_code=302
+    )
 
 
 async def logout(request: Request) -> Response:
     """GET /logout — clear cookie and bounce to login."""
-    resp = RedirectResponse("/login", status_code=302)
+    resp = RedirectResponse("/setup/login", status_code=302)
     resp.delete_cookie(COOKIE_NAME, path="/")
     return resp
 
@@ -2382,6 +2470,116 @@ IMMUTABLE_INSTALL_WARNING_JS = (
     '}catch(e){}return f.apply(this,arguments);};})();</script>'
 )
 
+# Cookie names hermes' dashboard-auth sessions use. Stripped from inbound
+# requests so a stale browser copy can never shadow the session we hold.
+HERMES_SESSION_COOKIE_PREFIX = "__Host-hermes_session"
+
+
+class HermesSession:
+    """The dashboard session this proxy logs in with, on the user's behalf.
+
+    Users authenticate once at our own login. Hermes' auth gate exists only so a
+    public URL can be declared (which is what makes MCP OAuth redirects resolve
+    to the real host), so nobody should ever meet a second login screen: we hold
+    a hermes session here and inject it into every proxied request.
+
+    Recovery is always possible because we hold the password — an expired or
+    invalidated session is just a re-login, not a dead end. Callers pass the
+    generation they last saw so a burst of concurrent 401s triggers ONE login
+    rather than one per request.
+    """
+
+    def __init__(self) -> None:
+        self._cookies: dict[str, str] = {}
+        self._generation = 0
+        self._lock = asyncio.Lock()
+        self._failed_note = False
+
+    def snapshot(self) -> tuple[int, dict[str, str]]:
+        """Current (generation, cookies) — cheap, lock-free read path."""
+        return self._generation, dict(self._cookies)
+
+    async def refresh(self, seen_generation: int) -> bool:
+        """Log in unless another caller already did since `seen_generation`."""
+        async with self._lock:
+            if self._generation != seen_generation:
+                return bool(self._cookies)
+            if await self._login():
+                self._generation += 1
+                return True
+            return False
+
+    async def _login(self) -> bool:
+        user, password = hermes_dashboard_credentials()
+        try:
+            resp = await get_http_client().post(
+                f"{HERMES_DASHBOARD_URL}/auth/password-login",
+                json={"provider": "basic", "username": user, "password": password},
+            )
+        except httpx.RequestError as e:
+            print(f"[dashboard-auth] login request failed: {e!r}", flush=True)
+            return False
+        if resp.status_code != 200:
+            # Don't spam every request once credentials are genuinely wrong.
+            if not self._failed_note:
+                self._failed_note = True
+                print(
+                    f"[dashboard-auth] login rejected ({resp.status_code}). The "
+                    f"dashboard will 401 until ADMIN_PASSWORD (or the explicit "
+                    f"HERMES_DASHBOARD_BASIC_AUTH_* vars) match what the "
+                    f"dashboard subprocess was started with.",
+                    flush=True,
+                )
+            return False
+        self._cookies = {k: v for k, v in resp.cookies.items()}
+        self._failed_note = False
+        print(f"[dashboard-auth] signed in as {user!r} ({len(self._cookies)} cookies)", flush=True)
+        return bool(self._cookies)
+
+
+hermes_session = HermesSession()
+
+
+def _merge_session_cookie(header: str | None, session: dict[str, str]) -> str:
+    """Replace any inbound hermes session cookies with the ones we hold."""
+    kept = [
+        part.strip() for part in (header or "").split(";")
+        if part.strip() and not part.strip().startswith(HERMES_SESSION_COOKIE_PREFIX)
+    ]
+    kept.extend(f"{k}={v}" for k, v in session.items())
+    return "; ".join(kept)
+
+
+def _needs_dashboard_login(status: int, location: str) -> bool:
+    """True when hermes is telling us the injected session is not (or no longer) valid."""
+    if status == 401:
+        return True
+    return status in (302, 303, 307) and location.split("?", 1)[0].endswith("/login")
+
+
+# Shown only when hermes rejects our login — i.e. the credentials the dashboard
+# subprocess started with no longer match the ones we resolve. The usual cause
+# is ADMIN_PASSWORD changing without the dashboard being restarted.
+DASHBOARD_AUTH_FAILED_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Dashboard sign-in failed</title>
+<style>body{background:#0d0f14;color:#c9d1d9;font-family:ui-monospace,Menlo,monospace;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:480px;padding:32px;border:1px solid #252d3d;border-radius:12px;
+background:#14181f;text-align:center}
+h1{font-size:16px;color:#d29922;margin:0 0 12px;font-weight:600}
+p{font-size:13px;color:#6b7688;line-height:1.6;margin:0 0 16px}
+a{color:#6272ff;text-decoration:none;border:1px solid #252d3d;border-radius:6px;
+padding:7px 14px;font-size:12px;display:inline-block}
+a:hover{border-color:#6272ff}</style></head>
+<body><div class="card">
+<h1>⚠ Could not sign in to the Hermes dashboard</h1>
+<p>The admin panel is fine — only the embedded dashboard rejected our sign-in.</p>
+<p>This usually means the admin password changed after the dashboard started.
+Restart the gateway from Status (that restarts the dashboard too), or redeploy.</p>
+<a href="/setup">← Back to Setup</a>
+</div></body></html>"""
+
+
 DASHBOARD_UNAVAILABLE_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Dashboard starting…</title>
 <style>body{background:#0d0f14;color:#c9d1d9;font-family:ui-monospace,Menlo,monospace;
@@ -2421,18 +2619,37 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     }
     body = await request.body()
 
+    async def send(session: dict[str, str]) -> httpx.Response:
+        headers = dict(req_headers)
+        merged = _merge_session_cookie(headers.pop("cookie", None), session)
+        if merged:
+            headers["cookie"] = merged
+        return await client.request(request.method, target, headers=headers, content=body)
+
+    generation, session = hermes_session.snapshot()
     try:
-        upstream = await client.request(
-            request.method,
-            target,
-            headers=req_headers,
-            content=body,
-        )
+        upstream = await send(session)
+        # hermes' auth gate is on (we declare a public URL so MCP OAuth
+        # redirects resolve to the real host), so a 401 — or a bounce to
+        # /login — means the session we injected is absent or expired. Re-login
+        # once and replay. The browser must never receive that redirect: /login
+        # is OUR route, so forwarding it would bounce the user straight back
+        # here, forever.
+        if _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
+            if await hermes_session.refresh(generation):
+                _, session = hermes_session.snapshot()
+                upstream = await send(session)
     except (httpx.ConnectError, httpx.ConnectTimeout):
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
     except httpx.RequestError as e:
         print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
+
+    # Still unauthenticated after a fresh login — credentials genuinely don't
+    # match what the dashboard subprocess started with. Fail visibly rather
+    # than forwarding a redirect that would loop.
+    if _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
+        return HTMLResponse(DASHBOARD_AUTH_FAILED_HTML, status_code=502)
 
     # Surface non-2xx responses from hermes into Railway logs so we can
     # diagnose 401/500s without needing browser DevTools access.
@@ -2747,11 +2964,19 @@ ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 routes = [
     # Public — no auth required.
     Route("/health",                            route_health),
-    Route("/login",                             page_login,          methods=["GET"]),
-    Route("/login",                             login_post,          methods=["POST"]),
+    # Our sign-in lives under /setup/* so the bare /login path stays free.
+    # hermes' own gated dashboard redirects unauthenticated requests there, and
+    # a route of ours at /login would answer instead — the browser would bounce
+    # between the two forever (reproduced on v2026.8.27: 8 redirects, then the
+    # browser gives up). The proxy re-logins internally so that redirect should
+    # never reach a browser, but the path stays clear regardless.
+    Route("/login",                             login_redirect,      methods=["GET"]),
     Route("/logout",                            logout),
 
     # Our setup wizard + management API, all under /setup/* (cookie-auth guarded).
+    # /setup/login must precede the /setup/{path:path} catch-all further down.
+    Route("/setup/login",                       page_login,          methods=["GET"]),
+    Route("/setup/login",                       login_post,          methods=["POST"]),
     Route("/setup",                             page_index),
     Route("/setup/",                            page_index),
     Route("/setup/api/config",                  api_config_get,      methods=["GET"]),
