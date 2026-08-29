@@ -364,26 +364,24 @@ HERMES_PROVIDER_IDS = {
     "KILOCODE_API_KEY":      "kilocode",
     "OLLAMA_API_KEY":        "ollama-cloud",
     "AZURE_FOUNDRY_API_KEY": "azure-foundry",
-    # These three are NOT in hermes' own PROVIDER_REGISTRY — verified against
-    # BOTH hermes_cli/auth.py (resolve_provider(), used by the CLI/"auto"
-    # env-var auto-detect loop) AND hermes_cli/runtime_provider.py
-    # (resolve_runtime_provider(), what the gateway/embedded Chat tab actually
-    # call at agent-init) at v2026.7.1. Neither ever discovers them: "auto"
-    # only scans PROVIDER_REGISTRY's known env vars (these aren't in it, so
-    # they're invisible to it, full stop), and pinning one of these strings
-    # as an explicit provider id raises "Unknown provider '<id>'" — both
-    # produce a dead agent ("No inference provider configured" / "Unknown
-    # provider"), confirmed live for a 9Router custom-endpoint deployment.
-    # The only way any of them work is the same mechanism hermes' OWN
-    # dashboard uses for a self-hosted/aggregator endpoint: provider="custom"
-    # plus an explicit base_url + api_key written onto model.* directly
-    # (hermes_cli/runtime_provider.py's bare-"custom" trust path reads
-    # model.base_url/model.api_key from the model block — it does NOT consult
-    # config.yaml's custom_providers[] list for this, that list is display/
-    # bookkeeping only). See CUSTOM_STYLE_BASE_URLS and
-    # set_active_model_via_hermes(). Re-verify FIREWORKS_API_KEY/NOVITA_API_KEY
-    # base URLs against those providers' own docs (not hermes') if they ever
-    # change their API surface.
+    # Fireworks and Novita are routed through provider="custom" with a fixed
+    # base_url (CUSTOM_STYLE_BASE_URLS below) rather than their native ids.
+    #
+    # CORRECTION (v2026.8.27 audit): the old comment here claimed they are absent
+    # from hermes' PROVIDER_REGISTRY. That is false and was false when written —
+    # the registry auto-extends from plugins/model-providers/, and both ids are
+    # present with the right env vars in the BUILT IMAGE at v2026.8.13 and
+    # v2026.8.27 (registry grew 47 -> 58 entries this bump). The custom routing
+    # is kept anyway: it is what existing deployments have saved in config.yaml,
+    # and switching to native ids is a migration, not a comment fix. Note
+    # "openrouter" is genuinely absent from the registry yet still valid — it is
+    # hermes' built-in default, resolved outside the plugin registry
+    # (resolve_provider("openrouter") -> "openrouter", verified in-image).
+    #
+    # CUSTOM_PROVIDER_API_KEY is different: its base_url really is user-supplied
+    # (CUSTOM_PROVIDER_BASE_URL), so it has no entry in CUSTOM_STYLE_BASE_URLS.
+    # hermes' bare-"custom" trust path reads model.base_url / model.api_key from
+    # the model block — config.yaml's custom_providers[] list is display-only.
     "CUSTOM_PROVIDER_API_KEY": "custom",   # base_url is user-supplied (CUSTOM_PROVIDER_BASE_URL) — any OpenAI-compatible endpoint, e.g. 9Router
     "FIREWORKS_API_KEY":       "custom",
     "NOVITA_API_KEY":          "custom",
@@ -614,6 +612,33 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
         yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
 
 
+# Env keys that kill the dashboard if a hermes subprocess ever sees them. The
+# dashboard has no respawn supervisor, so each one means every proxied page 503s
+# until the container is redeployed, while /setup and /health stay green.
+#
+#   HERMES_PARENT_PID            v2026.8.13's _start_parent_death_watchdog()
+#                                (hermes_cli/web_server.py) polls it and
+#                                os._exit(0)s once that pid is gone. It is the
+#                                Electron desktop's orphan guard and is NOT
+#                                gated on HERMES_DESKTOP, so it arms on any
+#                                `hermes dashboard` carrying the key.
+#   HERMES_DASHBOARD_PUBLIC_URL  v2026.8.27 feeds it to
+#                                should_require_dashboard_auth(); a non-loopback
+#                                value turns the auth gate on even for a
+#                                loopback bind, and with no hermes auth provider
+#                                configured the dashboard SystemExits at
+#                                startup. See the matching note in start.sh.
+#
+# Stripped from BOTH the subprocess env and $HERMES_HOME/.env: hermes loads that
+# file into its own os.environ at startup, so popping alone is not enough
+# (reproduced locally for HERMES_PARENT_PID against v2026.8.13).
+DASHBOARD_KILLING_KEYS = ("HERMES_PARENT_PID", "HERMES_DASHBOARD_PUBLIC_URL")
+
+# Only a restored or hand-edited .env can carry these, so .env is healed once at
+# boot and after a restore rather than checked on every read.
+ENV_FILE_FORBIDDEN_KEYS = DASHBOARD_KILLING_KEYS
+
+
 def build_hermes_env() -> dict[str, str]:
     """Merge OS env + HERMES_HOME + .env file contents for a hermes subprocess.
 
@@ -647,32 +672,11 @@ def build_hermes_env() -> dict[str, str]:
     # config.yaml, and inherited by all three restart paths (in-band, SIGUSR1,
     # and the dashboard's detached restart). setdefault: set e.g. 120 to re-arm.
     env.setdefault("HERMES_RESTART_AFTER_TURN_TIMEOUT", "0")
-    # Never hand a hermes subprocess HERMES_PARENT_PID. v2026.8.13's new
-    # _start_parent_death_watchdog() (hermes_cli/web_server.py) polls that PID
-    # and calls os._exit(0) once it is gone — it is the Electron desktop's
-    # orphan guard, and it is NOT gated on HERMES_DESKTOP, so it arms itself on
-    # any `hermes dashboard` whose environment carries the key. Killing the
-    # dashboard is unrecoverable here: unlike Gateway it has no respawn
-    # supervisor, so every proxied page 503s until the container is redeployed.
-    # This pop covers the plausible vector — an operator pasting it in as a
-    # Railway service variable, which lands in our own os.environ.
-    #
-    # It is deliberately NOT the whole fix: hermes also loads $HERMES_HOME/.env
-    # into its own os.environ at startup, so a value sitting in that FILE
-    # re-arms the watchdog no matter what env we pass. _sanitize_env_file()
-    # handles that half at boot; both are needed.
-    env.pop("HERMES_PARENT_PID", None)
+    # Both vectors matter: this pop covers a Railway service variable (which
+    # lands in our own os.environ); _sanitize_env_file() covers the .env file.
+    for key in DASHBOARD_KILLING_KEYS:
+        env.pop(key, None)
     return env
-
-
-# Keys that must never survive in $HERMES_HOME/.env, because hermes re-reads
-# that file into its own os.environ and would act on them regardless of the env
-# we pass to the subprocess. Verified locally against v2026.8.13: with
-# HERMES_PARENT_PID=999999 in .env the dashboard os._exit(0)s seconds after
-# spawn ("[dashboard] exited cleanly (code 0)") and every proxied page 503s
-# permanently. Only a restored or hand-edited .env can carry it, so this is a
-# boot-time heal rather than a check on every read.
-ENV_FILE_FORBIDDEN_KEYS = ("HERMES_PARENT_PID",)
 
 
 def _sanitize_env_file() -> None:
@@ -1194,6 +1198,11 @@ RESPAWN_BASE_DELAY = 2.0     # first backoff (seconds)
 RESPAWN_MAX_DELAY  = 30.0    # backoff cap
 
 
+# v2026.8.27's cross-profile ownership gate (gateway/run.py) logs this and
+# exits 1 rather than displacing a PID it cannot attribute to this HERMES_HOME.
+REPLACE_REFUSED_MARKER = "Refusing --replace"
+
+
 class Gateway:
     def __init__(self):
         self.proc: asyncio.subprocess.Process | None = None
@@ -1238,8 +1247,18 @@ class Gateway:
             # die. --replace is hermes' own blessed fix for exactly this
             # class of stuck-lock — it force-kills whatever holds the lock
             # (graceful SIGTERM, escalating to SIGKILL) before claiming it.
+            # --external-supervisor: tells hermes a process manager owns this
+            # gateway. v2026.8.27 narrowed its self-stop guard from the inherited
+            # _HERMES_GATEWAY marker to _is_supervised_gateway_process(), which
+            # also requires a supervisor marker — none of systemd/launchd/s6
+            # applies here, so without this flag the agent's own terminal and
+            # execute_code tools will happily run `hermes gateway stop` on
+            # themselves (they run in-process, so they satisfy the PID-file
+            # ownership half). It does not change the exit-75 restart contract:
+            # /restart already takes the via_service branch on container
+            # detection (gateway/slash_commands.py), which this only ORs with.
             self.proc = await asyncio.create_subprocess_exec(
-                "hermes", "gateway", "run", "--replace",
+                "hermes", "gateway", "run", "--replace", "--external-supervisor",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
@@ -1259,14 +1278,15 @@ class Gateway:
         self.state = "stopping"
         self.proc.terminate()
         try:
-            # 20s, not 10s: tearing down several messaging adapters (Telegram +
-            # Discord + Slack polling loops, each draining in-flight sends) can
-            # outrun 10s, and SIGKILL mid-teardown skips hermes' atexit pid
-            # cleanup — which is exactly the leftover _clear_stale_pidfile()
-            # then has to mop up. Still well inside hermes' own drain+60s
-            # shutdown watchdog, and `--replace` on the next start displaces
-            # anything that did survive, so waiting longer costs only latency.
-            await asyncio.wait_for(self.proc.wait(), timeout=20)
+            # 45s, not 20s: v2026.8.27 added `agent.cron_drain_timeout` (default
+            # 30) so a SIGTERM now waits for an in-flight cron job to finish
+            # before tearing down adapters. At 20s we SIGKILLed mid-drain,
+            # defeating that and leaving the job marked running forever. 45s
+            # clears the 30s drain plus adapter teardown (Telegram + Discord +
+            # Slack polling loops) and still sits inside hermes' own 60s
+            # shutdown watchdog. SIGKILL also skips hermes' atexit pid cleanup,
+            # which is exactly the mess _clear_stale_pidfile() then mops up.
+            await asyncio.wait_for(self.proc.wait(), timeout=45)
         except asyncio.TimeoutError:
             self.proc.kill()
             await self.proc.wait()
@@ -1329,8 +1349,26 @@ class Gateway:
         # "PID file race lost". Scoped to the pid we just buried — never disturbs
         # a live gateway's lock.
         self._clear_stale_pidfile(dead_pid)
+        self._warn_if_replace_refused()
         self.restarts += 1
         await self.start(reset_budget=False)
+
+    def _warn_if_replace_refused(self) -> None:
+        """Surface v2026.8.27's `--replace` ownership gate, which no retry clears.
+
+        The gate refuses to displace a live PID it cannot attribute to this
+        HERMES_HOME and exits 1, so the respawn loop would otherwise burn its
+        whole budget printing nothing an operator can act on. A container
+        restart is the fix — start.sh sweeps the runtime records at boot.
+        """
+        recent = list(self.logs)[-30:]  # this exit's output, not the whole buffer
+        if not any(REPLACE_REFUSED_MARKER in line for line in recent):
+            return
+        self.logs.append(
+            "[gateway] hermes refused --replace: a live gateway holds the pid "
+            "record and cannot be proven to belong to this profile. Redeploy "
+            "the service to clear it (start.sh sweeps gateway.pid/lock/sock)."
+        )
 
     def _clear_stale_pidfile(self, dead_pid: int | None) -> None:
         if dead_pid is None:
@@ -1986,6 +2024,9 @@ _BACKUP_EXCLUDED_DIRS = {
     "hermes-agent", "__pycache__", ".git", "node_modules", "backups",
     "checkpoints", ".venv", "venv", "site-packages",
     ".cache", ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    # Added upstream in v2026.8.27: quick/pre-update state snapshots and the two
+    # live browser-profile dirs (Chromium holds their SQLite files locked).
+    "state-snapshots", "browser-profiles", "browser-profile",
 }
 
 

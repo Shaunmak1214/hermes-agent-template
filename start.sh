@@ -48,27 +48,30 @@ if [ ! -f /data/.hermes/auth.json ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP}" ]; t
   chmod 600 /data/.hermes/auth.json
 fi
 
-# Clear any stale gateway PID file left over from the previous container.
-# `hermes gateway` writes /data/.hermes/gateway.pid on start but does not
-# remove it on SIGTERM. Since /data is a persistent volume, the file
-# survives container restarts and causes every subsequent boot to exit with
-# "ERROR gateway.run: PID file race lost to another gateway instance".
-# No hermes process can be running at this point (we're pre-exec in a fresh
-# container), so removing the file unconditionally is safe.
-rm -f /data/.hermes/gateway.pid
+# Clear stale gateway runtime files left over from the previous container.
+# hermes writes these on start but does not remove them on SIGTERM, and /data
+# is a persistent volume, so they survive into the next boot:
+#   gateway.pid   -> "PID file race lost to another gateway instance"
+#   gateway.lock  -> since v2026.8.27 get_running_pid() also consults the lock,
+#                    and the new cross-profile gate makes `--replace` REFUSE a
+#                    pid it cannot prove owns this HERMES_HOME (gateway/run.py
+#                    "Refusing --replace"), which no retry can clear
+#   gateway.sock  -> a stale control socket blocks the fresh bind
+# No hermes process can be running here (we are pre-exec in a fresh
+# container), so removing all three unconditionally is safe.
+rm -f /data/.hermes/gateway.pid /data/.hermes/gateway.lock /data/.hermes/gateway.sock
 
-# Tell the dashboard its externally reachable URL.
-# hermes >= v2026.7.20 builds the MCP OAuth redirect_uri from the request's own
-# Host header. Our reverse proxy must strip that Host (hermes 400s anything but
-# loopback on a loopback bind), so hermes would otherwise hand the OAuth
-# provider `http://127.0.0.1:9119/...` — a URL only reachable inside this
-# container, leaving the browser on a dead tab after consent with nothing in the
-# logs. resolve_public_url() checks HERMES_DASHBOARD_PUBLIC_URL first, so
-# setting it is the supported fix. Railway injects RAILWAY_PUBLIC_DOMAIN; `:=`
-# keeps an operator-set value (e.g. a custom domain) winning.
-if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
-  : "${HERMES_DASHBOARD_PUBLIC_URL:=https://${RAILWAY_PUBLIC_DOMAIN}}"
-  export HERMES_DASHBOARD_PUBLIC_URL
-fi
+# HERMES_DASHBOARD_PUBLIC_URL is deliberately NOT set (removed in v2026.8.27).
+# We used to derive it from RAILWAY_PUBLIC_DOMAIN so hermes could build MCP
+# OAuth redirect_uris that point at the public host rather than the loopback
+# backend our proxy talks to. As of v2026.8.27 that same value feeds
+# should_require_dashboard_auth() (hermes_cli/web_server.py): a non-loopback
+# public_url turns the dashboard auth gate ON even on a loopback bind, and with
+# no hermes auth provider configured the dashboard SystemExits at startup.
+# Dashboard has no respawn supervisor, so every proxied page 503s until the
+# container is redeployed — while /setup and /health stay green.
+# Trade-off accepted: MCP OAuth flows that need a redirect back to the
+# dashboard land on the loopback URL and fail; everything else works. Do not
+# re-add this without also solving the auth gate (see server.py:build_hermes_env).
 
 exec python /app/server.py
