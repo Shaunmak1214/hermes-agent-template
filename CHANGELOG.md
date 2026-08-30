@@ -11,6 +11,93 @@ release.
 
 ---
 
+## release/v2026.8.27/1 — August 29, 2026
+**Hermes v2026.8.27 · major (Hermes upgrade, from v2026.8.13)**
+
+### Hermes update
+- Hermes Agent **v2026.8.13 → v2026.8.27**, covering five upstream releases
+  (8.16, 8.16.2, 8.18, 8.19, 8.27). The provider registry grew 47 → 58 entries;
+  none of the 22 ids this template maps were renamed or removed.
+- **Sub-agent limits raised upstream.** `delegation.max_iterations` (per-child
+  tool-call budget) goes 50 → 250 and `max_concurrent_children` 3 → 10. Both are
+  left at upstream's defaults, but they land differently: `max_iterations` is
+  written into an existing `config.yaml`, so existing deployments keep 50 until
+  they run a config migration, while `max_concurrent_children` is *not* written
+  — so it inherits the new default immediately on upgrade. Existing bots
+  therefore run up to 3× more sub-agents in parallel straight away, which can
+  raise provider spend.
+
+### Changes to support upstream updates
+- **The dashboard would not have started at all, and MCP sign-ins would have
+  broken.** v2026.8.27 routes `dashboard.public_url` into the new
+  `should_require_dashboard_auth()` (`hermes_cli/web_server.py`), so a
+  non-loopback public URL engages hermes' auth gate *even on a loopback bind*;
+  with no auth provider the dashboard `SystemExit`s at startup. `start.sh`
+  derived that value from `RAILWAY_PUBLIC_DOMAIN`, so every deploy would have
+  503'd every proxied page while `/setup` and `/health` stayed green — `Dashboard`
+  has no respawn supervisor. Reproduced in Docker with an A/B pair (identical
+  images, only `RAILWAY_PUBLIC_DOMAIN` differing): `HERMES_DASHBOARD_READY` vs
+  `EXITED with code 1`.
+
+  Simply suppressing the URL fixes the dashboard but breaks something else: it
+  is *also* the base hermes builds MCP OAuth `redirect_uri`s from
+  (`_mcp_oauth_callback_url`), so every OAuth MCP server would redirect to
+  `http://127.0.0.1:9119/...` — a dead page, silently. Verified live on both
+  releases: v2026.8.13 returned the real public URL, v2026.8.27 returned
+  loopback.
+
+  So the template **satisfies the gate** rather than dodging it. Hermes' bundled
+  `basic` auth provider is configured from the same admin credentials the setup
+  page already uses, and `server.py` signs in to the dashboard on the user's
+  behalf, injecting that session into proxied requests. **Nobody sees a second
+  login screen**, and MCP redirects resolve to the real host. On by default,
+  nothing to configure; `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` / `_PASSWORD` /
+  `_SECRET` are available as explicit overrides.
+- **The sign-in page moved to `/setup/login`.** Gated hermes redirects
+  unauthenticated requests to `/login`, and a route of ours at that path answered
+  instead — the browser bounced between the two until it gave up (8 redirects,
+  reproduced). `/login` now redirects to the new path so bookmarks keep working,
+  and the proxy re-signs-in and replays internally so that redirect should never
+  reach a browser at all.
+- **Dashboard sessions survive restarts.** Hermes signs its session tokens with a
+  per-process key unless one is supplied, and every config save restarts the
+  dashboard. The key is now generated once and kept on the volume.
+- **Restores could abort on a sound backup.** Upstream's `_EXCLUDED_DIRS` gained
+  `state-snapshots`, `browser-profiles` and `browser-profile`; our
+  `_BACKUP_EXCLUDED_DIRS` mirror still had the old 15, so any `.db` under those
+  paths was demanded from an archive hermes deliberately never writes — and a
+  failed completeness check *aborts the restore*. Verified both directions in
+  the container: the old set demanded `snap.db`/`Cookies.db`/`History.db`, the
+  new set demands only the three real databases.
+- **The agent could stop its own gateway.** v2026.8.27 narrowed the self-stop
+  guard from the inherited `_HERMES_GATEWAY` marker to
+  `_is_supervised_gateway_process()`, which additionally requires a supervisor
+  marker — none of systemd/launchd/s6 applies here, so the agent's `terminal`
+  and `execute_code` tools (which run in-process, satisfying the PID-file half)
+  could shut the bot down. Now spawned with `--external-supervisor`, which is
+  simply true. Verified: guard `False` without the flag, `True` with it. The
+  exit-75 restart contract is untouched — `/restart` already takes the
+  `via_service` branch on container detection.
+- **Shutdown no longer kills a running scheduled job.** New
+  `agent.cron_drain_timeout` (default 30s) makes hermes wait for an in-flight
+  cron job before tearing down adapters; `Gateway.stop()` killed at 20s, so the
+  job died mid-run and stayed marked running. Raised to 45s, still inside
+  hermes' own 60s shutdown watchdog.
+- **Stale gateway lock files cleared at boot.** A new cross-profile ownership
+  gate makes `--replace` *refuse* a PID it cannot attribute to this
+  `HERMES_HOME`, which no retry clears. `start.sh` now sweeps `gateway.lock` and
+  `gateway.sock` alongside `gateway.pid`, and the supervisor logs an actionable
+  line if the refusal is ever hit.
+
+### Improvements
+- **OpenRouter keys are checked before you save.** Upstream added
+  `KNOWN_PROVIDER_KEY_PREFIXES`, and a key not starting with `sk-or-` is now
+  silently skipped with only a log line — producing a bot that never replies,
+  for this template's first-listed, README-recommended provider. Setup now warns
+  inline as soon as the pasted value can't work.
+
+---
+
 ## release/v2026.8.13/1 — August 15, 2026
 **Hermes v2026.8.13 · major (Hermes upgrade, from v2026.8.3)**
 
