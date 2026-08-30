@@ -61,6 +61,18 @@ fi
 # container), so removing all three unconditionally is safe.
 rm -f /data/.hermes/gateway.pid /data/.hermes/gateway.lock /data/.hermes/gateway.sock
 
+
+# Durable lazy-install target for opt-in backends (supermemory, mem0, firecrawl, etc.).
+# The template installs hermes into system Python (`uv pip install --system`) with no
+# venv, so `uv pip install` at runtime fails with "No virtual environment found." Set
+# HERMES_LAZY_INSTALL_TARGET to redirect runtime package installs into a writable dir
+# on the persistent volume — same mechanism the official Docker image bakes in. This
+# must be exported so the gateway process inherits it; hermes_bootstrap.py activates it
+# at startup. Without it, any lazy dep (including opt-in providers like supermemory)
+# fails on every fresh container deploy.
+mkdir -p /data/.hermes/lazy-packages
+export HERMES_LAZY_INSTALL_TARGET=/data/.hermes/lazy-packages
+
 # HERMES_DASHBOARD_PUBLIC_URL is deliberately NOT exported here. server.py owns
 # it: build_hermes_env() sets it only alongside the basic-auth credentials that
 # satisfy hermes' auth gate. Declaring the URL without them makes the dashboard
